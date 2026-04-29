@@ -37,6 +37,9 @@ async function planDataverseQueries(userQuery) {
     "- Include only relevant table(s).",
     "- Do not include top. Always fetch the full matching table/query result and derive the answer from that full dataset.",
     "- Use empty queries array if no Dataverse lookup is needed.",
+    `- Today's date is ${new Date().toISOString().split("T")[0]}. Use ISO 8601 format (e.g. 2026-04-01) for date values in OData $filter expressions. Never leave a date placeholder empty.`,
+    "- OData $filter does NOT support arithmetic operators (/, *, +, -) or ratio/percentage expressions. Never write expressions like 'col1 / col2 gt 0.8'. For ratio-based conditions, omit the ratio from the filter entirely and rely on post-processing. Only use simple comparisons (eq, ne, gt, ge, lt, le) and logical operators (and, or, not) in $filter.",
+    "- OData $filter requires the right-hand side of every comparison to be a constant literal (e.g. a number, string, or date). Never compare two columns against each other (e.g. 'col1 ge col2' is invalid). If the condition requires comparing two fields, omit it from the filter and handle it in post-processing.",
   ].join("\n");
 
   const tableContext = TABLE_DEFINITIONS.map(
