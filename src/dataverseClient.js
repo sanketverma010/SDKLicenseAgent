@@ -2,7 +2,6 @@ const config = require("./config");
 
 const API_VERSION = "v9.2";
 
-// Replace these placeholders with your real Dataverse entity set names.
 const TABLE_DEFINITIONS = [
   {
     key: "table1",
@@ -82,7 +81,6 @@ async function fetchWithRetry(url, options, maxRetries = 3) {
         throw error;
       }
       
-      // Exponential backoff: 500ms, 1000ms, 2000ms...
       const delayMs = Math.min(500 * Math.pow(2, attempt - 1), 5000);
       console.warn(
         `[Dataverse] Retry ${attempt}/${maxRetries} after ${delayMs}ms due to: ${error?.code || error?.message}`
