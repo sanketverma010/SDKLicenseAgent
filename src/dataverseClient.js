@@ -231,6 +231,28 @@ function getDataverseTableByKey(tableKey) {
   return TABLE_BY_KEY[tableKey];
 }
 
+/*
+ * Execute a server-side OData $apply aggregation query against a Dataverse table.
+ * Returns the aggregate result rows (typically very few rows).
+ * Example apply: "aggregate(gl_overage with sum as totalOverage)"
+ * Example apply: "groupby((gl_name),aggregate(gl_overage with sum as totalOverage))"
+ */
+async function queryDataverseTableAggregate(accessToken, entitySet, apply, filter) {
+  const comment = `Aggregate on '${entitySet}' apply=${apply}`;
+  try {
+    let queryOptions = `$apply=${encodeURIComponent(apply)}`;
+    if (filter) {
+      queryOptions += `&$filter=${encodeURIComponent(filter)}`;
+    }
+    const data = await queryDataverseTable(accessToken, entitySet, queryOptions);
+    logDataverseQuery("queryDataverseTableAggregate", comment, true);
+    return data.value || [];
+  } catch (error) {
+    logDataverseQuery("queryDataverseTableAggregate", comment, false, error?.message);
+    throw error;
+  }
+}
+
 module.exports = {
   fetchWithRetry,
   getApiBaseUrl,
@@ -240,4 +262,5 @@ module.exports = {
   getTableRecords,
   queryDataverseTable,
   queryDataverseTableAll,
+  queryDataverseTableAggregate,
 };

@@ -8,6 +8,7 @@ const {
   getDataverseTableByKey,
   getDataverseTableDefinitions,
   getTableRecords,
+  queryDataverseTableAggregate,
 } = require("./dataverseClient");
 
 const client = new AzureOpenAI({
@@ -32,10 +33,11 @@ async function planDataverseQueries(userQuery) {
   const plannerSystemPrompt = [
     "You choose which Dataverse tables to query for a user question.",
     "Output must be valid JSON only.",
-    'Schema: {"queries":[{"tableKey":"table1|table2|table3|table4","filter":"optional odata $filter","select":"optional comma list","orderBy":"optional order by"}]}',
+    '- Schema: {"queries":[{"tableKey":"table1|table2|table3|table4","filter":"optional odata $filter","select":"optional comma list","orderBy":"optional order by","apply":"optional odata $apply aggregation expression"}]}',
     "Rules:",
     "- Include only relevant table(s).",
     "- Do not include top. Always fetch the full matching table/query result and derive the answer from that full dataset.",
+    "- If the question is a pure aggregate (e.g. sum, count, average, groupby), set 'apply' to a valid OData $apply expression (e.g. 'aggregate(gl_overage with sum as totalOverage)' or 'groupby((gl_name),aggregate(gl_overage with sum as totalOverage))'). When 'apply' is set, omit 'select' and 'orderBy'.",
     "- Use empty queries array if no Dataverse lookup is needed.",
     `- Today's date is ${new Date().toISOString().split("T")[0]}. Use ISO 8601 format (e.g. 2026-04-01) for date values in OData $filter expressions. Never leave a date placeholder empty.`,
     "- OData $filter does NOT support arithmetic operators (/, *, +, -) or ratio/percentage expressions. Never write expressions like 'col1 / col2 gt 0.8'. For ratio-based conditions, omit the ratio from the filter entirely and rely on post-processing. Only use simple comparisons (eq, ne, gt, ge, lt, le) and logical operators (and, or, not) in $filter.",
@@ -69,8 +71,21 @@ async function planDataverseQueries(userQuery) {
       top: null,
       select: q?.select,
       orderBy: q?.orderBy,
+      apply: q?.apply || null,
     }))
     .filter((q) => getDataverseTableByKey(q.tableKey));
+}
+
+const MAX_ROWS_TO_LLM = 300;
+
+function stripAnnotations(record) {
+  const clean = {};
+  for (const key of Object.keys(record)) {
+    if (!key.includes("@")) {
+      clean[key] = record[key];
+    }
+  }
+  return clean;
 }
 
 async function fetchDataverseContext(userQuery) {
@@ -84,6 +99,26 @@ async function fetchDataverseContext(userQuery) {
 
   for (const query of plannedQueries) {
     const table = getDataverseTableByKey(query.tableKey);
+
+    // --- Strategy 1: OData $apply server-side aggregation ---
+    if (query.apply) {
+      const aggregateRows = await queryDataverseTableAggregate(
+        accessToken,
+        table.entitySet,
+        query.apply,
+        query.filter
+      );
+      tableData.push({
+        tableKey: table.key,
+        entitySet: table.entitySet,
+        aggregated: true,
+        rowCount: aggregateRows.length,
+        rows: aggregateRows.map(stripAnnotations),
+      });
+      continue;
+    }
+
+    // --- Strategy 2: Full fetch with map-reduce if over limit ---
     let rows = await getTableRecords(
       accessToken,
       table.entitySet,
@@ -93,15 +128,80 @@ async function fetchDataverseContext(userQuery) {
       query.orderBy
     );
 
-    tableData.push({
-      tableKey: table.key,
-      entitySet: table.entitySet,
-      rowCount: rows.length,
-      rows,
-    });
+    const totalCount = rows.length;
+    rows = rows.map(stripAnnotations);
+
+    if (rows.length > MAX_ROWS_TO_LLM) {
+      // Map-reduce: summarize chunks, then push the combined summary
+      const summary = await summarizeInChunks(userQuery, table.key, rows);
+      tableData.push({
+        tableKey: table.key,
+        entitySet: table.entitySet,
+        totalCount,
+        mapReduceSummary: true,
+        summary,
+      });
+    } else {
+      tableData.push({
+        tableKey: table.key,
+        entitySet: table.entitySet,
+        totalCount,
+        rowCount: rows.length,
+        rows,
+      });
+    }
   }
 
   return { plannedQueries, tableData };
+}
+
+const CHUNK_SIZE = 250;
+
+async function summarizeInChunks(userQuery, tableKey, rows) {
+  const chunks = [];
+  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+    chunks.push(rows.slice(i, i + CHUNK_SIZE));
+  }
+
+  const partialSummaries = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const result = await client.chat.completions.create({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a data analyst. Extract and summarize only facts directly relevant to the user question from the provided records. Be concise — output key numbers, names, and findings. Do not explain the data structure.",
+        },
+        {
+          role: "user",
+          content: `User question: ${userQuery}\n\nTable: ${tableKey} (chunk ${i + 1}/${chunks.length}, ${chunk.length} records):\n${JSON.stringify(chunk)}`,
+        },
+      ],
+      model: "",
+    });
+    partialSummaries.push(result.choices?.[0]?.message?.content || "");
+  }
+
+  // Reduce: synthesize partial summaries into one
+  if (partialSummaries.length === 1) return partialSummaries[0];
+
+  const reduceResult = await client.chat.completions.create({
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a data analyst. Combine the following partial summaries into a single cohesive summary relevant to the user question. Resolve duplicates and aggregate numbers where possible.",
+      },
+      {
+        role: "user",
+        content: `User question: ${userQuery}\n\nPartial summaries:\n${partialSummaries.map((s, i) => `[${i + 1}] ${s}`).join("\n\n")}`,
+      },
+    ],
+    model: "",
+  });
+
+  return reduceResult.choices?.[0]?.message?.content || partialSummaries.join(" | ");
 }
 
 async function generateAnswerFromData(userQuery, dataverseContext) {
@@ -109,6 +209,8 @@ async function generateAnswerFromData(userQuery, dataverseContext) {
     "Use Dataverse results as primary source.",
     "If data is empty, say that clearly and suggest next useful question.",
     "Do not invent unavailable fields or records.",
+    "If a table has mapReduceSummary=true, the 'summary' field contains a pre-processed condensed summary of all records — use it as the source of truth.",
+    "If a table has aggregated=true, the 'rows' field contains OData aggregate results — use them directly.",
   ].join("\n");
 
   const result = await client.chat.completions.create({
